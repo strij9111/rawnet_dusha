@@ -33,7 +33,7 @@ from audiomentations import Compose, SevenBandParametricEQ, RoomSimulator, AirAb
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512"
 
-root_dir = "c:\\Users\\Profi\\Downloads\\ru-uz\\data"
+root_dir = "./data"
 batch_size = 16
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
     
@@ -219,12 +219,12 @@ model = (RawNet3.MainModel(
     ))
 
 model = model.to("cuda:0")
-#state_dict = torch.load("rawnet_temp_model.pth")
-#model.load_state_dict(state_dict)
+state_dict = torch.load("rawnet_focal_model.pth")
+model.load_state_dict(state_dict)
 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
 EPOCHS = 40
-lr = 0.00001
+lr = 0.000001
 best_val_loss = float('inf')
 epochs_without_improvement = 0
 

@@ -5,55 +5,78 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class PreEmphasis(torch.nn.Module):
-    def __init__(self, coef: float = 0.97) -> None:
+class PreEmphasis(nn.Module):
+    """
+    Класс для применения преэмфазного фильтра к аудиосигналу с возможностью
+    использования фильтров произвольного порядка и обучаемыми коэффициентами.
+
+    Параметры:
+        coeffs (list или numpy.array): Коэффициенты фильтра. Если None, используется [1, -0.97].
+        channels (int): Количество каналов во входном сигнале. По умолчанию 1.
+        trainable (bool): Если True, коэффициенты фильтра обучаются. По умолчанию False.
+
+    Пример использования:
+        pre_emphasis = PreEmphasis(coeffs=[1, -0.97], channels=1, trainable=False)
+        output = pre_emphasis(input_tensor)
+    """
+    def __init__(self, coeffs=None, channels=1, trainable=False):
         super().__init__()
-        self.coef = coef
-        # make kernel
-        # In pytorch, the convolution operation uses cross-correlation. So, filter is flipped.
-        self.register_buffer(
-            "flipped_filter",
-            torch.FloatTensor([-self.coef, 1.0]).unsqueeze(0).unsqueeze(0),
-        )
+        self.channels = channels
+        self.trainable = trainable
 
-    def forward(self, input: torch.tensor) -> torch.tensor:
-        assert (
-            len(input.size()) == 2
-        ), "The number of dimensions of input tensor must be 2!"
-        # reflect padding to match lengths of in/out
-        input = input.unsqueeze(1)
+        if coeffs is None:
+            coeffs = [1.0, -0.97]
 
-        """
-        Warning: Constant folding - Only steps=1 can be constant folded for opset >= 10 onnx::Slice op. Constant folding not applied.
+        coeffs = torch.tensor(coeffs, dtype=torch.float32).view(1, 1, -1)
 
-        https://github.com/pytorch/pytorch/issues/73843
-        """
-        #input = F.pad(input, (1, 0), "reflect")
-        return F.conv1d(input, self.flipped_filter)
+        if trainable:
+            self.coeffs = nn.Parameter(coeffs.repeat(channels, 1, 1))
+        else:
+            self.register_buffer('coeffs', coeffs.repeat(channels, 1, 1))
+
+    def forward(self, input):
+        if input.dim() == 2:
+            input = input.unsqueeze(1)  # Добавляем размерность каналов
+        elif input.dim() != 3:
+            raise ValueError("Входной тензор должен иметь 2 или 3 измерения")
+
+        batch_size, channels, signal_length = input.shape
+        if channels != self.channels:
+            raise ValueError(f"Ожидалось {self.channels} каналов, но получено {channels}")
+
+        # Применяем свертку с соответствующим паддингом
+        padding = self.coeffs.shape[2] - 1
+        output = F.conv1d(input, self.coeffs, padding=padding, groups=self.channels)
+        output = output[:, :, :signal_length]  # Обрезаем до исходной длины сигнала
+        return output
 
 
 class AFMS(nn.Module):
     """
-    Alpha-Feature map scaling, added to the output of each residual block[1,2].
+    Блок Squeeze-and-Excitation (SE) для канального внимания.
 
-    Reference:
-    [1] RawNet2 : https://www.isca-speech.org/archive/Interspeech_2020/pdfs/1011.pdf
-    [2] AMFS    : https://www.koreascience.or.kr/article/JAKO202029757857763.page
+    Параметры:
+        nb_dim (int): Количество входных каналов.
+        reduction (int): Коэффициент сокращения. По умолчанию 16.
+
+    Ссылка:
+        Hu, Jie, et al. "Squeeze-and-excitation networks." CVPR, 2018.
     """
-
-    def __init__(self, nb_dim: int) -> None:
+    def __init__(self, nb_dim, reduction=16):
         super().__init__()
-        self.alpha = nn.Parameter(torch.ones((nb_dim, 1)))
-        self.fc = nn.Linear(nb_dim, nb_dim)
-        self.sig = nn.Sigmoid()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(nb_dim, nb_dim // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(nb_dim // reduction, nb_dim, bias=False),
+            nn.Sigmoid()
+        )
 
     def forward(self, x):
-        y = F.adaptive_avg_pool1d(x, 1).view(x.size(0), -1)
-        y = self.sig(self.fc(y)).view(x.size(0), x.size(1), -1)
-
-        x = x + self.alpha
-        x = x * y
-        return x
+        b, c, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1)
+        return x * y
 
 
 class Bottle2neck(nn.Module):

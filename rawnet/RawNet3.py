@@ -1,6 +1,8 @@
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn import MultiheadAttention
 import sys
 
 
@@ -9,14 +11,35 @@ try :
     from .asteroid_filterbanks import Encoder, ParamSincFB, MultiphaseGammatoneFB
 except ImportError :
     from RawNetBasicBlock import Bottle2neck, PreEmphasis
-    from asteroid_filterbanks import Encoder, ParamSincFB, MultiphaseGammatoneFB
+    from asteroid_filterbanks import Encoder, ParamSincFB, MultiphaseGammatoneFB, MelGramFB
 
-
-class RawNet3(nn.Module):
-    def __init__(self, block, model_scale, context, summed, C=1024, sr=16000 , **kwargs):
+class PositionalEncoding(nn.Module):
+    """
+    Позиционное кодирование для последовательных данных.
+    """
+    def __init__(self, d_model, max_len=16000):
         super().__init__()
+        pe = torch.zeros(max_len, d_model).float()
+        pe.require_grad = False
 
-        nOut = 256
+        position = torch.arange(0, max_len).float().unsqueeze(1)
+        div_term = (
+            torch.exp(torch.arange(0, d_model, 2).float() * -(math.log(10000.0) / d_model))
+        )
+        pe[:, 0::2] = torch.sin(position * div_term)
+        if d_model % 2 == 1:
+            pe[:, 1::2] = torch.cos(position * div_term[:-1])
+        else:
+            pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0).transpose(1, 2)
+        self.register_buffer("pe", pe)
+
+    def forward(self, x):
+        return x + self.pe[:, :, : x.size(2)]
+        
+class RawNet3(nn.Module):
+    def __init__(self, block, model_scale, context, summed, C=1024, sr=16000, nOut=256, **kwargs):
+        super().__init__()
 
         self.context = context
         self.encoder_type = "ECA"
@@ -33,7 +56,7 @@ class RawNet3(nn.Module):
 #        print("summed: {}".format(self.summed))
 
         self.preprocess = nn.Sequential(
-            PreEmphasis(), 
+            PreEmphasis(coeffs=[1, -0.97], channels=1, trainable=True),
             nn.BatchNorm1d(1,eps=1e-4,affine=True)
         )
         self.conv1 = Encoder(
@@ -41,10 +64,11 @@ class RawNet3(nn.Module):
                 C // 4,
                 251,
                 stride=3,
-                sample_rate =  sr
+                fmax=sr//2,
+                sample_rate=sr
             )
         )
-        self.relu = nn.ReLU()
+        self.relu = nn.GELU()
         self.bn1 = nn.BatchNorm1d(C // 4)
 
         self.layer1 = block(
@@ -67,31 +91,30 @@ class RawNet3(nn.Module):
 
         self.attention = nn.Sequential(
             nn.Conv1d(attn_input, 128, kernel_size=1),
-            nn.ReLU(),
+            nn.GELU(),
             nn.BatchNorm1d(128),
             nn.Conv1d(128, attn_output, kernel_size=1),
             nn.Softmax(dim=2),
         )
-
+        self.positional_encoding = PositionalEncoding(d_model=C // 4)
+        
         self.bn5 = nn.BatchNorm1d(3072)
 
         self.fc6 = nn.Linear(3072, nOut)
-        self.fc7 = nn.Linear(nOut, 2)
+        self.fc7 = nn.Linear(nOut, 5)
         self.bn6 = nn.BatchNorm1d(nOut)
 #        self.bn7 = nn.BatchNorm1d(nOut)
         self.mp3 = nn.MaxPool1d(3)
         
-    @torch.cuda.amp.autocast()
+    @torch.amp.autocast(device_type='cuda', dtype=torch.float16)
     def forward(self, x):
-        """
-        :param x: input mini-batch (bs, samp)
-        """
+        # Предварительная обработка и преобразования
+        x = self.preprocess(x)
+        x = torch.abs(self.conv1(x))
+        x = torch.log(x + 1e-6)
+        x = x - torch.mean(x, dim=-1, keepdim=True)
 
-        with torch.cuda.amp.autocast(enabled=False):
-            x = self.preprocess(x)
-            x = torch.abs(self.conv1(x))
-            x = torch.log(x + 1e-6)
-            x = x - torch.mean(x, dim=-1, keepdim=True)
+        x = self.positional_encoding(x)
 
         x1 = self.layer1(x)
         x2 = self.layer2(x1)
